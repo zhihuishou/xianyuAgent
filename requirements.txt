@@ -1,2 +1,11 @@
 requests
 loguru
+websockets
+PyExecJS
+blackboxprotobuf
+pydantic
+typing_extensions
+openai
+python-dotenv
+qrcode
+pillow

@@ -4,13 +4,28 @@ import asyncio
 import threading
 import time
 
+from dotenv import load_dotenv
+load_dotenv()
+
+import os
+from pathlib import Path
 from loguru import logger
+
+# 日志输出到 logs/ 目录，按天滚动
+Path('logs').mkdir(exist_ok=True)
+import sys
+logger.remove()
+logger.add(sys.stderr, level='DEBUG')
+logger.add('logs/xianyu_{time:YYYY-MM-DD}.log', rotation='00:00', retention='7 days', encoding='utf-8', level='DEBUG')
 import websockets
-from goofish_apis import XianyuApis
+from goofish_apis import XianyuApis, qrcode_login
 
 from utils.goofish_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt, \
     get_session_cookies_str
+from utils.cookie_store import save_cookies, load_cookies, clear_cookies
+from utils.feishu_notify import notify_feishu
 from message import Message, make_text, make_image
+from ai_agent import ask
 
 
 class XianyuLive:
@@ -22,6 +37,13 @@ class XianyuLive:
         self.device_id = generate_device_id(self.myid)
         self.xianyu = XianyuApis(self.cookies, self.device_id)
         self.ws = None
+        # 人工介入过的会话 cid 集合，介入后该会话不再 AI 回复
+        self._human_cids: set = set()
+        # 已处理过的 messageId，防止重连后重复回复
+        self._seen_msg_ids: set = set()
+        # 按 cid 的串行队列，同一会话内消息顺序处理不乱序
+        self._cid_queues: dict = {}
+        self._cid_workers: dict = {}
 
     async def list_all_conversations(self, cid):
         headers = {
@@ -35,7 +57,7 @@ class XianyuLive:
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
-        async with websockets.connect(self.base_url, extra_headers=headers) as websocket:
+        async with websockets.connect(self.base_url, additional_headers=headers) as websocket:
             asyncio.create_task(self.init(websocket))
             send_mid = generate_mid()
             msg = {
@@ -198,11 +220,44 @@ class XianyuLive:
         await ws.send(json.dumps(msg))
 
     async def init(self, ws):
-        data = self.xianyu.get_token()
-        token = data['data']['accessToken'] if 'data' in data and 'accessToken' in data['data'] else ''
-        if not token:
-            logger.error('获取token失败')
+        token = ''
+        cookie_invalid = False
+        for attempt in range(5):
+            try:
+                data = self.xianyu.get_token()
+                token = data['data']['accessToken'] if 'data' in data and 'accessToken' in data['data'] else ''
+                if not token and 'ret' in data:
+                    ret_msg = data['ret'][0] if data['ret'] else ''
+                    if '令牌过期' in ret_msg or 'SESSION_EXPIRED' in ret_msg:
+                        # 真正的 cookie 失效
+                        cookie_invalid = True
+                        break
+                    elif 'RGV587' in ret_msg or '被挤爆' in ret_msg or 'punish' in str(data):
+                        # 风控限流，等待后重试
+                        wait = 10 * (attempt + 1)
+                        logger.warning(f'get_token 触发风控，{wait}秒后重试 ({attempt+1}/5)...')
+                        await asyncio.sleep(wait)
+                        continue
+                    else:
+                        logger.warning(f'get_token 未知错误: {ret_msg}，5秒后重试 ({attempt+1}/5)...')
+                        await asyncio.sleep(5)
+                        continue
+            except Exception as e:
+                logger.warning(f'get_token 异常 (attempt {attempt+1}/5): {e}')
+                await asyncio.sleep(3)
+            if token:
+                break
+
+        if cookie_invalid:
+            logger.error('Cookie 已失效，推送飞书通知')
+            notify_feishu('Cookie 失效', '令牌过期，请重新扫码登录后重启服务')
+            clear_cookies()
             exit(0)
+
+        if not token:
+            # 风控/网络问题，不删 cookie，只记日志，等下次心跳或重连时自然重试
+            logger.error('获取token失败（可能是风控或网络），保留 cookie 待下次重试')
+            return
         msg = {
             "lwp": "/reg",
             "headers": {
@@ -252,7 +307,12 @@ class XianyuLive:
     def user_alive(self):
         while True:
             time.sleep(600)
-            self.xianyu.refresh_token()
+            res = self.xianyu.refresh_token()
+            if 'ret' in res and res['ret'] and ('FAIL' in res['ret'][0] or '令牌' in res['ret'][0]):
+                logger.warning(f'refresh_token 失败: {res["ret"]}')
+                notify_feishu('Cookie 失效', f'refresh_token 返回错误：{res["ret"][0]}，请重新扫码登录后重启服务')
+                clear_cookies()
+                exit(0)
 
     async def main(self):
         headers = {
@@ -267,7 +327,7 @@ class XianyuLive:
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
         threading.Thread(target=self.user_alive).start()
-        async with websockets.connect(self.base_url, extra_headers=headers) as websocket:
+        async with websockets.connect(self.base_url, additional_headers=headers) as websocket:
             asyncio.create_task(self.init(websocket))
             asyncio.create_task(self.heart_beat(websocket))
             async for message in websocket:
@@ -288,50 +348,125 @@ class XianyuLive:
                     ack["headers"]["dt"] = message["headers"]["dt"]
                 await websocket.send(json.dumps(ack))
 
-                await self.handle_message(message, websocket)
+                asyncio.create_task(self.handle_message(message, websocket))
 
     async def handle_message(self, message, websocket):
         try:
-            data = message["body"]["syncPushPackage"]["data"][0]["data"]
-            data = json.loads(data)
-            # logger.info(f"无需解密 message: {data}")
-        except Exception as e:
+            raw = message["body"]["syncPushPackage"]["data"][0]["data"]
+        except (KeyError, IndexError, TypeError):
+            return
+
+        try:
+            decrypted = decrypt(raw)
+            msg_obj = json.loads(decrypted)
+        except Exception:
+            return
+
+        node1 = msg_obj.get("1")
+        if not isinstance(node1, dict):
+            return
+
+        node10 = node1.get("10")
+        if not isinstance(node10, dict):
+            return
+
+        send_user_name = node10.get("reminderTitle", "")
+        send_user_id = node10.get("senderUserId", "")
+        send_message = node10.get("reminderContent", "")
+        if not send_message or not send_user_id:
+            return
+
+        # messageId 去重，防止重连后重复回复
+        ext_json_str = node10.get("extJson", "{}")
+        try:
+            msg_id = json.loads(ext_json_str).get("messageId", "")
+        except Exception:
+            msg_id = ""
+        if msg_id and msg_id in self._seen_msg_ids:
+            logger.debug(f"[SKIP] 重复消息 {msg_id}，跳过")
+            return
+        if msg_id:
+            self._seen_msg_ids.add(msg_id)
+            # 最多保留最近 1000 条，避免无限增长
+            if len(self._seen_msg_ids) > 1000:
+                self._seen_msg_ids.pop()
+
+        cid_raw = node1.get("2", "")
+        cid = (cid_raw[0] if isinstance(cid_raw, list) else cid_raw).split('@')[0]
+
+        # 从 reminderUrl 里解析 itemId
+        item_id = ""
+        reminder_url = node10.get("reminderUrl", "")
+        if "itemId=" in reminder_url:
             try:
-                data = decrypt(data)
-                message = json.loads(data)
-                # logger.info(f"解密的 message: {message}")
-
-                send_user_name = message["1"]["10"]["reminderTitle"]
-                send_user_id = message["1"]["10"]["senderUserId"]
-                send_message = message["1"]["10"]["reminderContent"]
-                logger.info(f"user: {send_user_name}, 发送给我的信息 message: {send_message}")
-
-                cid = message["1"]["2"]
-                cid = cid.split('@')[0]
-
-                # 回复文字
-                # reply = f'Hello, {send_user_name}! I am a robot. I am not available now. I will reply to you later.'
-                reply = f'{send_user_name} 说了: {send_message}'
-                await self.send_msg(websocket, cid, send_user_id, make_text(reply))
-
-                # 回复图片
-                # res_json = self.xianyu.upload_media(r"D:\Desktop\1.png")
-                # image_object = res_json["object"]
-                # width, height = map(int, image_object["pix"].split('x'))
-                # await self.send_msg(websocket, cid, send_user_id, make_image(image_object["url"], width, height))
-            except Exception as e:
+                item_id = reminder_url.split("itemId=")[1].split("&")[0]
+            except Exception:
                 pass
+
+        # 店主自己发消息 → 标记该会话为人工介入，跳过 AI
+        if send_user_id == self.myid:
+            self._human_cids.add(cid)
+            logger.info(f"[HUMAN] 店主介入会话 {cid}，后续 AI 静默")
+            return
+
+        # 该会话已有人工介入 → 跳过 AI
+        if cid in self._human_cids:
+            logger.debug(f"[SKIP] 会话 {cid} 已人工介入，跳过 AI: {send_message}")
+            return
+
+        logger.info(f"user: {send_user_name}({send_user_id}), item: {item_id}, msg: {send_message}")
+
+        # 按 cid 入队，同一会话内串行处理，不同会话并发
+        await self._enqueue(cid, send_message, item_id, send_user_id, websocket)
+
+    async def _enqueue(self, cid, send_message, item_id, send_user_id, websocket):
+        if cid not in self._cid_queues:
+            self._cid_queues[cid] = asyncio.Queue()
+        await self._cid_queues[cid].put((send_message, item_id, send_user_id, websocket))
+
+        # 该 cid 没有 worker 在跑，启动一个
+        if cid not in self._cid_workers or self._cid_workers[cid].done():
+            self._cid_workers[cid] = asyncio.create_task(self._cid_worker(cid))
+
+    async def _cid_worker(self, cid):
+        queue = self._cid_queues[cid]
+        while not queue.empty():
+            send_message, item_id, send_user_id, websocket = await queue.get()
+            try:
+                import random
+                await asyncio.sleep(random.uniform(1.5, 3.5))
+                reply = await ask(send_message, item_info=item_id)
+                logger.info(f"AI reply → cid={cid}: {reply}")
+                await self.send_msg(websocket, cid, send_user_id, make_text(reply))
+            except Exception as e:
+                import traceback
+                logger.error(f"ask/send error cid={cid}: {e}\n{traceback.format_exc()}")
+            finally:
+                queue.task_done()
 
 
 if __name__ == '__main__':
-    cookies_str = r''
-    xianyuLive = XianyuLive(cookies_str)
+    import os
+    from utils.goofish_utils import trans_cookies_str
 
-    # 1 获取全部聊天记录
-    # cid = '47812870000'
-    # all_messages = asyncio.run(xianyuLive.list_all_conversations(cid))
-    # for message in all_messages:
-    #     print(message)
+    cookies = load_cookies()
+    if cookies:
+        logger.info('从 cookies.json 加载登录态')
+        cookies_str = trans_cookies_str(cookies)
+        xianyuLive = XianyuLive(cookies_str)
+        # 清掉 __init__ 里无 domain 的 cookie，重新以正确 domain 写入
+        xianyuLive.xianyu.session.cookies.clear()
+        for name, value in cookies.items():
+            xianyuLive.xianyu.session.cookies.set(name, value, domain='.goofish.com', path='/')
+    else:
+        logger.info('未找到 cookies.json，启动扫码登录...')
+        xianyu_api = qrcode_login()
+        save_cookies(xianyu_api.session)
+        logger.info('登录成功，cookie 已保存到 cookies.json')
+        cookies_str = get_session_cookies_str(xianyu_api.session)
+        xianyuLive = XianyuLive(cookies_str)
+        # 用扫码登录拿到的 session 替换，保留完整 cookie 状态
+        xianyuLive.xianyu.session = xianyu_api.session
 
-    # 2 常驻进程 用于接收消息和自动回复
+    # 常驻进程 用于接收消息和 AI 自动回复
     asyncio.run(xianyuLive.main())

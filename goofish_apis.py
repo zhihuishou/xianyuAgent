@@ -13,9 +13,12 @@ from typing import Optional, List
 from urllib.parse import quote
 
 import requests
+from dotenv import load_dotenv
+load_dotenv()
 
 from message.types import Price, DeliverySettings
 from utils.goofish_utils import generate_sign, trans_cookies, generate_device_id
+from utils.feishu_notify import notify_feishu
 
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36')
@@ -94,7 +97,7 @@ def build_initial_cookies() -> dict:
 
 
 def qrcode_login(poll_interval: float = 3.0, timeout: float = 120.0,
-                 show_qrcode: bool = True) -> 'XianyuApis':
+                 show_qrcode: bool = True, notify: bool = True) -> 'XianyuApis':
     """扫码登录闲鱼，返回已登录的 XianyuApis 实例。
 
     流程：
@@ -153,6 +156,15 @@ def qrcode_login(poll_interval: float = 3.0, timeout: float = 120.0,
 
     print(f'[qrcode_login] QR URL: {qr_url}')
     print(f'[qrcode_login] Scan with XianYu APP (top-left corner -> scan)')
+
+    # 推送二维码到飞书
+    if notify:
+        try:
+            from utils.feishu_notify import notify_feishu_qrcode
+            notify_feishu_qrcode(qr_url)
+            print('[qrcode_login] 二维码已推送到飞书')
+        except Exception as e:
+            print(f'[qrcode_login] 飞书推送失败: {e}')
 
     # 终端打印二维码（用半块字符 ▀▄█ 使其接近正方形）
     if show_qrcode:
@@ -340,8 +352,8 @@ class XianyuApis:
                         self.session.cookies.clear(domain=key.domain, path=key.path, name=key.name)
                         break
         res_json = response.json()
-        if 'ret' in res_json and '令牌过期' in res_json['ret'][0]:
-            return self.get_token()
+        if 'ret' in res_json and res_json['ret'] and '令牌过期' in res_json['ret'][0]:
+            notify_feishu('Cookie 失效', f'get_token 返回「令牌过期」，请重新扫码登录后重启服务')
         return res_json
 
 
