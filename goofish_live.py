@@ -249,10 +249,10 @@ class XianyuLive:
                 break
 
         if cookie_invalid:
-            logger.error('Cookie 已失效，推送飞书通知')
-            notify_feishu('Cookie 失效', '令牌过期，请重新扫码登录后重启服务')
+            logger.error('Cookie 已失效，正在推送扫码二维码…')
             clear_cookies()
-            exit(0)
+            threading.Thread(target=_do_relogin, daemon=False).start()
+            return
 
         if not token:
             # 风控/网络问题，不删 cookie，只记日志，等下次心跳或重连时自然重试
@@ -310,9 +310,9 @@ class XianyuLive:
             res = self.xianyu.refresh_token()
             if 'ret' in res and res['ret'] and ('FAIL' in res['ret'][0] or '令牌' in res['ret'][0]):
                 logger.warning(f'refresh_token 失败: {res["ret"]}')
-                notify_feishu('Cookie 失效', f'refresh_token 返回错误：{res["ret"][0]}，请重新扫码登录后重启服务')
+                notify_feishu('Cookie 失效', f'refresh_token 返回错误：{res["ret"][0]}，正在推送扫码二维码…')
                 clear_cookies()
-                exit(0)
+                _do_relogin()
 
     async def main(self):
         headers = {
@@ -445,8 +445,20 @@ class XianyuLive:
                 queue.task_done()
 
 
+def _do_relogin():
+    """Cookie 失效时：推二维码到飞书 → 等扫码 → 保存 cookie → 重启进程。"""
+    logger.info('开始扫码重新登录...')
+    try:
+        xianyu_api = qrcode_login()          # 内部已推飞书二维码
+        save_cookies(xianyu_api.session)
+        logger.info('扫码成功，cookie 已保存，重启进程...')
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        logger.error(f'重新登录失败: {e}，进程退出')
+        sys.exit(1)
+
+
 if __name__ == '__main__':
-    import os
     from utils.goofish_utils import trans_cookies_str
 
     cookies = load_cookies()
