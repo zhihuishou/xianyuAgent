@@ -406,13 +406,13 @@ class XianyuLive:
         # 店主自己发消息 → 标记该会话为人工介入，跳过 AI
         if send_user_id == self.myid:
             self._human_cids.add(cid)
-            logger.info(f"[HUMAN] 店主介入会话 {cid}，后续 AI 静默")
+            logger.info(f"[HUMAN] 店主介入会话 {cid}，AI 静默直到买家下一条消息")
             return
 
-        # 该会话已有人工介入 → 跳过 AI
+        # 买家发新消息 → 解除人工介入标记，AI 重新接管
         if cid in self._human_cids:
-            logger.debug(f"[SKIP] 会话 {cid} 已人工介入，跳过 AI: {send_message}")
-            return
+            self._human_cids.discard(cid)
+            logger.info(f"[RESUME] 会话 {cid} 买家重新发消息，AI 恢复")
 
         logger.info(f"user: {send_user_name}({send_user_id}), item: {item_id}, msg: {send_message}")
 
@@ -433,8 +433,15 @@ class XianyuLive:
         while not queue.empty():
             send_message, item_id, send_user_id, websocket = await queue.get()
             try:
+                if cid in self._human_cids:
+                    logger.debug(f"[SKIP] 会话 {cid} 已人工介入，丢弃队列中消息: {send_message}")
+                    continue
                 import random
                 await asyncio.sleep(random.uniform(1.5, 3.5))
+                # sleep 后再检查一次，防止等待期间店主介入
+                if cid in self._human_cids:
+                    logger.debug(f"[SKIP] 会话 {cid} 介入（sleep后），丢弃: {send_message}")
+                    continue
                 reply = await ask(send_message, item_info=item_id)
                 logger.info(f"AI reply → cid={cid}: {reply}")
                 await self.send_msg(websocket, cid, send_user_id, make_text(reply))
